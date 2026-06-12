@@ -1,123 +1,149 @@
 package com.dosne.minigames.viewmodel
 
-import androidx.lifecycle.ViewModel
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.dosne.minigames.data.AppDatabase
+import com.dosne.minigames.data.Score
+import com.dosne.minigames.data.ScoreRepository
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.random.Random
 
-class ReactionViewModel : ViewModel() {
-    // États pour la gestion du jeu
-    var isRunning by mutableStateOf(false)
-        private set
-    
-    var elapsedMs by mutableStateOf(15000L)
-        private set
-    
-    var targetValue by mutableStateOf(5000L)
-        private set
-    
-    var gamePhase by mutableStateOf("playing")
-        private set
-    
-    var difference by mutableStateOf(0L)
-        private set
-    
-    private var step by mutableStateOf(10L)
-    
-    private val random = java.util.Random()
-    
+enum class ReactionPhase {
+    READY,
+    PLAYING,
+    RESULT
+}
+
+data class ReactionUiState(
+    val phase: ReactionPhase = ReactionPhase.READY,
+    val elapsedMs: Long = 0L,
+    val targetMs: Long = 0L,
+    val differenceMs: Long = 0L,
+    val speedLabel: String = "",
+    val isBlind: Boolean = false
+) {
+    val score: Int
+        get() = (10_000 - differenceMs).coerceAtLeast(0).toInt()
+}
+
+class ReactionViewModel(application: Application) : AndroidViewModel(application) {
+    private val repository = ScoreRepository(
+        AppDatabase.getDatabase(application).scoreDao()
+    )
+    private val _uiState = MutableStateFlow(ReactionUiState())
+    val uiState: StateFlow<ReactionUiState> = _uiState.asStateFlow()
+
+    private var timerJob: Job? = null
+    private var stepMs = 10L
+    private var playerName = ""
+    private var scoreSaved = false
+
     init {
-        initializeGame()
+        prepareRound()
     }
-    
-    /**
-     * Initialise les paramètres aléatoires du jeu
-     */
-    private fun initializeGame() {
-        val speed = 0.5 + random.nextDouble() * 1.0 // Entre 0.5 et 1.5
-        val direction = if (random.nextBoolean()) 1 else -1 // 1 ou -1
-        val startValue = random.nextLong(20000) // Entre 0 et 20000 ms
-        val target = random.nextLong(8000) + 1000 // Entre 1000 et 9000 ms
-        
-        elapsedMs = startValue
-        targetValue = target
-        step = (10 * speed * direction).toLong()
-        gamePhase = "playing"
-        isRunning = false
-    }
-    
-    /**
-     * Démarre le timer
-     */
-    fun startTimer() {
-        isRunning = true
-    }
-    
-    /**
-     * Arrête le timer et affiche le résultat
-     */
-    fun stopTimer() {
-        isRunning = false
-        difference = abs(elapsedMs - targetValue)
-        gamePhase = "result"
-    }
-    
-    /**
-     * Incrémente le temps écoulé (appelé à chaque itération du timer)
-     */
-    fun updateTimer() {
-        if (isRunning) {
-            elapsedMs += step
-            
-            // Arrêter si le timer sort des limites
-            if (elapsedMs < 0) {
-                isRunning = false
-                elapsedMs = 0
+
+    fun startGame(playerName: String) {
+        if (_uiState.value.phase == ReactionPhase.PLAYING) return
+
+        this.playerName = playerName.trim()
+        scoreSaved = false
+        prepareRound()
+        _uiState.update { it.copy(phase = ReactionPhase.PLAYING) }
+
+        timerJob?.cancel()
+        timerJob = viewModelScope.launch {
+            while (_uiState.value.phase == ReactionPhase.PLAYING) {
+                delay(10L)
+                tick()
             }
         }
     }
-    
-    /**
-     * Réinitialise le jeu pour une nouvelle partie
-     */
-    fun restartGame() {
-        initializeGame()
+
+    fun stopTimer() {
+        if (_uiState.value.phase != ReactionPhase.PLAYING) return
+
+        timerJob?.cancel()
+        val current = _uiState.value
+        _uiState.update {
+            it.copy(
+                phase = ReactionPhase.RESULT,
+                differenceMs = abs(current.elapsedMs - current.targetMs),
+                isBlind = false
+            )
+        }
+        saveScore()
     }
-    
-    /**
-     * Retourne la couleur du timer en fonction de la proximité de la cible
-     */
-    fun getTimerColor(): Long {
-        val gap = abs(elapsedMs - targetValue)
+
+    fun reset() {
+        timerJob?.cancel()
+        scoreSaved = false
+        prepareRound()
+    }
+
+    fun feedbackMessage(): String {
+        val difference = _uiState.value.differenceMs
         return when {
-            gap < 100 -> 0xFF4CAF50 // Vert
-            gap < 300 -> 0xFFFFC107 // Orange
-            else -> 0xFF2196F3 // Bleu
+            difference < 100 -> "Excellent !"
+            difference < 300 -> "Très bon réflexe"
+            difference < 700 -> "Pas mal"
+            else -> "À retenter"
         }
     }
-    
-    /**
-     * Retourne le message de feedback en fonction de l'écart
-     */
-    fun getFeedbackMessage(): String {
-        return when {
-            difference < 100 -> "Excellent!"
-            difference < 300 -> "Bon!"
-            difference < 500 -> "Pas mal"
-            else -> "À recommencer"
+
+    private fun prepareRound() {
+        val start = Random.nextLong(2_000L, 18_000L)
+        val distance = Random.nextLong(2_500L, 7_000L)
+        val goesUp = Random.nextBoolean()
+        val target = if (goesUp) {
+            (start + distance).coerceAtMost(25_000L)
+        } else {
+            (start - distance).coerceAtLeast(0L)
+        }
+        val speed = listOf(6L, 8L, 10L, 12L, 15L).random()
+
+        stepMs = if (target >= start) speed else -speed
+        _uiState.value = ReactionUiState(
+            phase = ReactionPhase.READY,
+            elapsedMs = start,
+            targetMs = target,
+            speedLabel = "Vitesse x${"%.1f".format(speed / 10.0)}"
+        )
+    }
+
+    private fun tick() {
+        _uiState.update { state ->
+            val nextValue = (state.elapsedMs + stepMs).coerceIn(0L, 25_000L)
+            val blind = abs(nextValue - state.targetMs) < 900L
+            state.copy(elapsedMs = nextValue, isBlind = blind)
         }
     }
-    
-    /**
-     * Retourne la couleur du feedback en fonction de l'écart
-     */
-    fun getFeedbackColor(): Long {
-        return when {
-            difference < 100 -> 0xFF4CAF50 // Vert
-            difference < 300 -> 0xFF2196F3 // Bleu
-            difference < 500 -> 0xFFFFC107 // Orange
-            else -> 0xFFFF5252 // Rouge
+
+    private fun saveScore() {
+        val currentPlayer = playerName.ifBlank { return }
+        if (scoreSaved) return
+        scoreSaved = true
+
+        viewModelScope.launch {
+            repository.insertScore(
+                Score(
+                    playerName = currentPlayer,
+                    gameName = "Reaction",
+                    score = _uiState.value.score
+                )
+            )
         }
+    }
+
+    override fun onCleared() {
+        timerJob?.cancel()
+        super.onCleared()
     }
 }
